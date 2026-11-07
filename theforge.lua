@@ -1,4 +1,4 @@
--- == The Forge: Auto-Mine V49 (Top Hit then Bottom) ==
+-- == The Forge: Auto-Mine V53 (No Auto-Equip, English UI) ==
 pcall(function() setfpscap(60) end)
 
 local Players           = game:GetService("Players")
@@ -6,7 +6,81 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService        = game:GetService("RunService")
 local UserInputService  = game:GetService("UserInputService")
 local TweenService      = game:GetService("TweenService")
+local HttpService       = game:GetService("HttpService")
 local LocalPlayer       = Players.LocalPlayer
+
+-- ==========================================
+-- CONFIG SYSTEM
+-- ==========================================
+local ConfigFile = "ForgeAutoMine_Config.json"
+
+local defaults = {
+    AutoMine         = false,
+    StandDistance    = 3,
+    RightOffset      = 2.5,
+    FlySpeed         = 60,
+    MinDelay         = 0.25,
+    MaxDelay         = 0.4,
+    SelectedRocks    = {},
+    ToggleKey        = Enum.KeyCode.RightShift,
+    SkipKey          = Enum.KeyCode.Z,
+    AutoSelectAll    = false,
+    RotateToRock     = false,
+    SkipDuration     = 30,
+    StuckTimeout     = 10,
+}
+
+local function SaveConfig()
+    if not writefile then return end
+    local data = {
+        AutoMine      = false,
+        StandDistance = getgenv().Config.StandDistance,
+        RightOffset   = getgenv().Config.RightOffset,
+        FlySpeed      = getgenv().Config.FlySpeed,
+        MinDelay      = getgenv().Config.MinDelay,
+        MaxDelay      = getgenv().Config.MaxDelay,
+        SelectedRocks = getgenv().Config.SelectedRocks,
+        ToggleKey     = getgenv().Config.ToggleKey.Name,
+        SkipKey       = getgenv().Config.SkipKey.Name,
+        RotateToRock  = getgenv().Config.RotateToRock,
+        SkipDuration  = getgenv().Config.SkipDuration,
+        StuckTimeout  = getgenv().Config.StuckTimeout,
+    }
+    local success, encoded = pcall(function() return HttpService:JSONEncode(data) end)
+    if success then
+        pcall(writefile, ConfigFile, encoded)
+    end
+end
+
+local function LoadConfig()
+    getgenv().Config = {}
+    for k, v in pairs(defaults) do getgenv().Config[k] = v end
+
+    if not isfile or not readfile then return end
+    if isfile(ConfigFile) then
+        local success, content = pcall(readfile, ConfigFile)
+        if success and content then
+            local decodeSuccess, data = pcall(function() return HttpService:JSONDecode(content) end)
+            if decodeSuccess and type(data) == "table" then
+                for k, v in pairs(data) do
+                    if k == "ToggleKey" or k == "SkipKey" then
+                        local key = Enum.KeyCode[v]
+                        if key then getgenv().Config[k] = key end
+                    elseif k == "SelectedRocks" then
+                        if type(v) == "table" then getgenv().Config[k] = v end
+                    elseif k ~= "AutoMine" then
+                        getgenv().Config[k] = v
+                    end
+                end
+            end
+        end
+    end
+    
+    -- Force AutoMine to false on load
+    getgenv().Config.AutoMine = false
+end
+
+LoadConfig()
 
 -- ==========================================
 -- STATE
@@ -27,10 +101,11 @@ local MyTick = getgenv().CurrentScriptTick
 getgenv().ForgeMinerLoaded  = true
 
 local CurrentTarget  = nil
-local TargetPhase    = "Top" -- "Top" или "Bottom"
+local TargetPhase    = "Top" 
 local SavedHumanoid  = {}
 local SkippedRocks   = {}
 local TargetStartTime = 0
+local OriginalCollisions = {}
 
 local function Alive()
     return getgenv().ScriptActive and getgenv().CurrentScriptTick == MyTick
@@ -65,16 +140,29 @@ local function ToggleNoclip(enabled)
     getgenv().Noclip = enabled
     local char = LocalPlayer.Character
     if not char then return end
+    
+    for _, v in ipairs(char:GetDescendants()) do
+        if v:IsA("BasePart") and OriginalCollisions[v] == nil then
+            OriginalCollisions[v] = v.CanCollide
+        end
+    end
+    
     for _, v in ipairs(char:GetDescendants()) do
         if v:IsA("BasePart") then
-            if v.Name == "HumanoidRootPart" then
+            if enabled then
                 v.CanCollide = false
-            elseif v.Name == "Head" or v.Name == "Torso" or v.Name == "UpperTorso"
-                or v.Name == "LowerTorso" or v.Name:match("Arm")
-                or v.Name:match("Leg")  or v.Name:match("Foot") then
-                v.CanCollide = not enabled
+            else
+                if OriginalCollisions[v] ~= nil then
+                    v.CanCollide = OriginalCollisions[v]
+                else
+                    v.CanCollide = (v.Name ~= "HumanoidRootPart")
+                end
             end
         end
+    end
+    
+    if not enabled then
+        table.clear(OriginalCollisions)
     end
 end
 
@@ -118,29 +206,6 @@ end
 getgenv().ForgeCleanup = Cleanup
 
 -- ==========================================
--- CONFIG
--- ==========================================
-local defaults = {
-    AutoMine         = false,
-    StandDistance    = 3,
-    RightOffset      = 2.5,
-    FlySpeed         = 60,
-    MinDelay         = 0.25,
-    MaxDelay         = 0.4,
-    SelectedRocks    = {},
-    ToggleKey        = Enum.KeyCode.RightShift,
-    SkipKey          = Enum.KeyCode.Z,
-    AutoSelectAll    = false,
-    RotateToRock     = false,
-    SkipDuration     = 30,
-    StuckTimeout     = 10,
-}
-getgenv().Config = getgenv().Config or {}
-for k, v in pairs(defaults) do
-    if getgenv().Config[k] == nil then getgenv().Config[k] = v end
-end
-
--- ==========================================
 -- TOOL ACTIVATION
 -- ==========================================
 local function ActivateTool()
@@ -152,21 +217,6 @@ local function ActivateTool()
             VirtualUser:ClickButton1(Vector2.new(0,0))
         end
     end)
-end
-
-local function EnsureToolEquipped(Character)
-    if not Character then return nil end
-    local tool = Character:FindFirstChildOfClass("Tool")
-    if tool then return tool end
-    local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
-    if not backpack then return nil end
-    local bpTool = backpack:FindFirstChildOfClass("Tool")
-    if not bpTool then return nil end
-    local hum = Character:FindFirstChildOfClass("Humanoid")
-    if not hum then return nil end
-    pcall(function() hum:EquipTool(bpTool) end)
-    task.wait(0.15)
-    return Character:FindFirstChildOfClass("Tool") or bpTool
 end
 
 -- ==========================================
@@ -191,7 +241,6 @@ local function IsMineableRock(Hitbox)
     return Model:FindFirstChild("infoFrame", true) ~= nil
 end
 
--- Функция возвращает точку, куда смотреть (верх или низ)
 local function GetLookPos(Hitbox, phase)
     if phase == "Top" then
         return Hitbox.Position + Vector3.new(0, Hitbox.Size.Y / 2, 0)
@@ -200,7 +249,6 @@ local function GetLookPos(Hitbox, phase)
     end
 end
 
--- Функция возвращает позицию для телепорта/полета с учетом фазы и смещения
 local function GetStandPos(Hitbox, phase)
     local lookPos = GetLookPos(Hitbox, phase)
     local rightVec = Hitbox.CFrame.RightVector
@@ -272,8 +320,14 @@ task.spawn(function()
     while Alive() do
         task.wait(1)
         if getgenv().Noclip and LocalPlayer.Character then
-            for _, v in ipairs(LocalPlayer.Character:GetDescendants()) do
-                if v:IsA("BasePart") and v.CanCollide then v.CanCollide = false end
+            local char = LocalPlayer.Character
+            for _, v in ipairs(char:GetDescendants()) do
+                if v:IsA("BasePart") then
+                    if OriginalCollisions[v] == nil then
+                        OriginalCollisions[v] = v.CanCollide
+                    end
+                    v.CanCollide = false
+                end
             end
         end
     end
@@ -327,7 +381,7 @@ local Title = Instance.new("TextLabel")
 Title.Size = UDim2.new(1, -100, 1, 0)
 Title.Position = UDim2.new(0, 15, 0, 0)
 Title.BackgroundTransparency = 1
-Title.Text = "The Forge | Auto Miner V49"
+Title.Text = "The Forge | Auto Miner V53"
 Title.TextColor3 = Color3.fromRGB(255, 255, 255)
 Title.Font = Enum.Font.GothamBold
 Title.TextSize = 14
@@ -415,7 +469,7 @@ local StatusLabel = Instance.new("TextLabel")
 StatusLabel.Size = UDim2.new(1, -16, 1, -8)
 StatusLabel.Position = UDim2.new(0, 8, 0, 4)
 StatusLabel.BackgroundTransparency = 1
-StatusLabel.Text = "Загрузка..."
+StatusLabel.Text = "Loading..."
 StatusLabel.TextColor3 = Color3.fromRGB(180, 220, 255)
 StatusLabel.Font = Enum.Font.Code
 StatusLabel.TextSize = 12
@@ -465,6 +519,7 @@ local function CreateToggle(parent, text, default, order, callback)
         TweenService:Create(Knob, TweenInfo.new(0.2),
             {Position = state and UDim2.new(1,-18,0.5,-8) or UDim2.new(0,2,0.5,-8)}):Play()
         callback(state)
+        SaveConfig()
     end)
 end
 
@@ -505,6 +560,7 @@ local function CreateInput(parent, text, default, order, callback)
         if not val then val = default end
         Box.Text = tostring(val)
         callback(val)
+        SaveConfig()
     end)
 end
 
@@ -724,8 +780,8 @@ local function SkipCurrentRock()
     end
 
     SetStatus(skippedAny
-        and string.format("Скипнут. Всего скипнуто: %d", CountSkipped())
-        or "Нечего скипать")
+        and string.format("Skipped. Total skipped: %d", CountSkipped())
+        or "Nothing to skip")
 end
 
 SkipBtn.MouseButton1Click:Connect(SkipCurrentRock)
@@ -743,6 +799,7 @@ Track(UserInputService.InputBegan:Connect(function(input, gp)
             end
             isBinding = false
             bindMode = nil
+            SaveConfig()
         end
     elseif not gp then
         local focused = false
@@ -771,7 +828,7 @@ local function RefreshRockList(types, total)
         local L = Instance.new("TextLabel")
         L.Size = UDim2.new(1, 0, 0, 40)
         L.BackgroundTransparency = 1
-        L.Text = "Руда не найдена.\nПодойди ближе к шахте и нажми Rescan."
+        L.Text = "No ores found.\nMove closer and click Rescan."
         L.TextColor3 = Color3.fromRGB(200, 120, 120)
         L.Font = Enum.Font.Gotham
         L.TextSize = 13
@@ -787,11 +844,15 @@ local function RefreshRockList(types, total)
 
     local existing = {}
     for _, n in ipairs(names) do existing[n] = true end
+    
+    local changed = false
     for i = #getgenv().Config.SelectedRocks, 1, -1 do
         if not existing[getgenv().Config.SelectedRocks[i]] then
             table.remove(getgenv().Config.SelectedRocks, i)
+            changed = true
         end
     end
+    if changed then SaveConfig() end
 
     local function selected(name)
         for _, n in ipairs(getgenv().Config.SelectedRocks) do
@@ -833,6 +894,7 @@ local function RefreshRockList(types, total)
                 Btn.BackgroundColor3 = Color3.fromRGB(60, 120, 200)
             end
             CurrentTarget = nil
+            SaveConfig()
         end)
     end
     RockList.CanvasSize = UDim2.new(0, 0, 0, #names * 30)
@@ -843,8 +905,8 @@ local function DoRescan()
     RefreshRockList(types, total)
     local tc = 0; for _ in pairs(types) do tc = tc + 1 end
     
-    SetStatus(string.format("Типов: %d | Выбрано: %d", tc, #getgenv().Config.SelectedRocks))
-    print(string.format("[Forge V49] Detected %d types", tc))
+    SetStatus(string.format("Types: %d | Selected: %d", tc, #getgenv().Config.SelectedRocks))
+    print(string.format("[Forge V53] Detected %d types", tc))
 end
 
 if RescanBtn then
@@ -866,8 +928,8 @@ task.spawn(function()
             RefreshRockList(types, total)
             local tc = 0; for _ in pairs(types) do tc = tc + 1 end
             
-            SetStatus(string.format("Авто-скан: типов %d, выбрано %d", tc, #getgenv().Config.SelectedRocks))
-            print("[Forge V49] Auto-rescan triggered")
+            SetStatus(string.format("Auto-scan: types %d, selected %d", tc, #getgenv().Config.SelectedRocks))
+            print("[Forge V53] Auto-rescan triggered")
         end
     end
 end)
@@ -883,7 +945,7 @@ local function FindClosestRock(Root)
         if hitbox.Parent and RockMatches(hitbox) and not IsSkipped(hitbox) then
             local hp = GetRockHP(hitbox)
             if hp and hp > 0 then
-                local standPos = GetStandPos(hitbox, "Bottom") -- Ищем по нижней позиции
+                local standPos = GetStandPos(hitbox, "Bottom")
                 local targetDist = (Root.Position - standPos).Magnitude
                 if targetDist < bestTargetDist then
                     closest, bestTargetDist = hitbox, targetDist
@@ -937,7 +999,7 @@ local function DoMine(Root, Humanoid, Hitbox)
     local isNewTarget = (CurrentTarget ~= Hitbox)
     if isNewTarget then
         CurrentTarget = Hitbox
-        TargetPhase = "Top" -- Новый камень, начинаем сверху
+        TargetPhase = "Top" 
         TargetStartTime = tick()
     end
 
@@ -960,10 +1022,9 @@ local function DoMine(Root, Humanoid, Hitbox)
 
     ActivateTool()
 
-    -- Если ударили сверху, переключаемся на низ для следующих ударов
     if TargetPhase == "Top" then
         TargetPhase = "Bottom"
-        task.wait(0.2) -- Небольшая пауза перед тем, как лететь вниз
+        task.wait(0.2) 
     end
 
     local delay = math.random(
@@ -976,7 +1037,7 @@ end
 -- MAIN LOOP
 -- ==========================================
 task.spawn(function()
-    print("[Forge V49] Main loop started")
+    print("[Forge V53] Main loop started")
     while Alive() do
         task.wait(0.1)
 
@@ -991,80 +1052,80 @@ task.spawn(function()
             else
                 local hum  = char:FindFirstChildOfClass("Humanoid")
                 local root = char:FindFirstChild("HumanoidRootPart")
+                
+                -- Check if tool is in hand
+                local tool = char:FindFirstChildOfClass("Tool")
 
                 if not hum or not root then
                     task.wait(0.5)
+                elseif not tool then
+                    -- Removed auto-equip logic, just warn
+                    ToggleNoclip(false)
+                    UnanchorRoot()
+                    if hum.PlatformStand then hum.PlatformStand = false end
+                    RestoreHumanoidState(hum)
+                    CurrentTarget = nil
+                    SetStatus("No tool equipped in hand!")
+                    task.wait(1)
                 else
-                    local tool = EnsureToolEquipped(char)
-                    if not tool then
+                    local hitbox, targetDist = FindClosestRock(root)
+                    if hitbox then
+                        local currentPhase = (CurrentTarget == hitbox) and TargetPhase or "Top"
+                        local standPos = GetStandPos(hitbox, currentPhase)
+                        local dist = (root.Position - standPos).Magnitude
+
+                        local shouldFly = false
+                        if not root.Anchored then
+                            if dist > 2.5 then shouldFly = true end
+                        else
+                            if dist > 12 then shouldFly = true end
+                        end
+
+                        if shouldFly then
+                            DoFly(root, hum, standPos)
+                            SetStatus(string.format("Target: %s\nDist: %.1f | Mode: Flying (%s)",
+                                hitbox:FindFirstAncestorWhichIsA("Model").Name, dist, currentPhase))
+                        else
+                            local isTimeout = false
+                            if getgenv().Config.StuckTimeout > 0 and CurrentTarget == hitbox then
+                                if (tick() - TargetStartTime) > getgenv().Config.StuckTimeout then
+                                    isTimeout = true
+                                end
+                            end
+
+                            if isTimeout then
+                                local model = hitbox:FindFirstAncestorWhichIsA("Model")
+                                if model then
+                                    SkippedRocks[model] = tick()
+                                end
+                                CurrentTarget = nil
+                                UnanchorRoot()
+                                KillRockMovers()
+                                if hum.PlatformStand then hum.PlatformStand = false end
+                                RestoreHumanoidState(hum)
+                                SetStatus(string.format("Rock not broken in %d sec. Skipped.", getgenv().Config.StuckTimeout))
+                                task.wait(0.5)
+                            else
+                                DoMine(root, hum, hitbox)
+                                local model = hitbox:FindFirstAncestorWhichIsA("Model")
+                                SetStatus(string.format("Target: %s\nDist: %.1f | Mode: Mining (%s)",
+                                    model and model.Name or "?", dist, TargetPhase))
+                            end
+                        end
+                    else
                         ToggleNoclip(false)
                         UnanchorRoot()
+                        KillRockMovers()
+                        CurrentTarget = nil
                         if hum.PlatformStand then hum.PlatformStand = false end
                         RestoreHumanoidState(hum)
-                        CurrentTarget = nil
-                        SetStatus("Нет кирки (ни в руках, ни в бэкпаке)")
-                        task.wait(1)
-                    else
-                        local hitbox, targetDist = FindClosestRock(root)
-                        if hitbox then
-                            -- Определяем, куда лететь/телепортироваться в зависимости от фазы
-                            local currentPhase = (CurrentTarget == hitbox) and TargetPhase or "Top"
-                            local standPos = GetStandPos(hitbox, currentPhase)
-                            local dist = (root.Position - standPos).Magnitude
-
-                            local shouldFly = false
-                            if not root.Anchored then
-                                if dist > 2.5 then shouldFly = true end
-                            else
-                                if dist > 12 then shouldFly = true end
-                            end
-
-                            if shouldFly then
-                                DoFly(root, hum, standPos)
-                                SetStatus(string.format("Цель: %s\nДо позиции: %.1f | Режим: Полет (%s)",
-                                    hitbox:FindFirstAncestorWhichIsA("Model").Name, dist, currentPhase))
-                            else
-                                local isTimeout = false
-                                if getgenv().Config.StuckTimeout > 0 and CurrentTarget == hitbox then
-                                    if (tick() - TargetStartTime) > getgenv().Config.StuckTimeout then
-                                        isTimeout = true
-                                    end
-                                end
-
-                                if isTimeout then
-                                    local model = hitbox:FindFirstAncestorWhichIsA("Model")
-                                    if model then
-                                        SkippedRocks[model] = tick()
-                                    end
-                                    CurrentTarget = nil
-                                    UnanchorRoot()
-                                    KillRockMovers()
-                                    if hum.PlatformStand then hum.PlatformStand = false end
-                                    RestoreHumanoidState(hum)
-                                    SetStatus(string.format("Камень не сломался за %d сек. Скипнут.", getgenv().Config.StuckTimeout))
-                                    task.wait(0.5)
-                                else
-                                    DoMine(root, hum, hitbox)
-                                    local model = hitbox:FindFirstAncestorWhichIsA("Model")
-                                    SetStatus(string.format("Цель: %s\nДо позиции: %.1f | Режим: Добыча (%s)",
-                                        model and model.Name or "?", dist, TargetPhase))
-                                end
-                            end
+                        
+                        if #getgenv().Config.SelectedRocks == 0 then
+                            SetStatus("Select rocks in DETECTED ROCKS list below")
                         else
-                            ToggleNoclip(false)
-                            UnanchorRoot()
-                            KillRockMovers()
-                            CurrentTarget = nil
-                            if hum.PlatformStand then hum.PlatformStand = false end
-                            RestoreHumanoidState(hum)
-                            
-                            if #getgenv().Config.SelectedRocks == 0 then
-                                SetStatus("Выберите камни в списке ниже (DETECTED ROCKS)")
-                            else
-                                SetStatus(string.format("Руда не найдена\nСкипнуто: %d", CountSkipped()))
-                            end
-                            task.wait(0.5)
+                            SetStatus(string.format("No ores found\nSkipped: %d", CountSkipped()))
                         end
+                        task.wait(0.5)
                     end
                 end
             end
