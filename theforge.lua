@@ -1,4 +1,4 @@
--- == The Forge: Auto-Mine V53 (No Auto-Equip, English UI) ==
+-- == The Forge: Auto-Mine & Auto Mobs (Tabbed UI + Perfect Collision Snapshot) ==
 pcall(function() setfpscap(60) end)
 
 local Players           = game:GetService("Players")
@@ -12,39 +12,52 @@ local LocalPlayer       = Players.LocalPlayer
 -- ==========================================
 -- CONFIG SYSTEM
 -- ==========================================
-local ConfigFile = "ForgeAutoMine_Config.json"
+local ConfigFile = "ForgeMiner_Mobs_Config.json"
 
 local defaults = {
+    ToggleKey        = Enum.KeyCode.RightShift,
+    FlySpeed         = 80,
+
     AutoMine         = false,
     StandDistance    = 3,
     RightOffset      = 2.5,
-    FlySpeed         = 60,
     MinDelay         = 0.25,
     MaxDelay         = 0.4,
     SelectedRocks    = {},
-    ToggleKey        = Enum.KeyCode.RightShift,
-    SkipKey          = Enum.KeyCode.Z,
-    AutoSelectAll    = false,
-    RotateToRock     = false,
-    SkipDuration     = 30,
-    StuckTimeout     = 10,
+    RotateToRock     = true,
+    SkipDurationRock = 30,
+    StuckTimeoutRock = 10,
+
+    FlyToMob         = false,
+    MobHeightOffset  = 3,
+    MobSideOffset    = 1,
+    TimeoutDelayMob  = 5,
+    SkipDurationMob  = 15,
+    SelectedMobs     = {},
 }
 
 local function SaveConfig()
     if not writefile then return end
     local data = {
-        AutoMine      = false,
-        StandDistance = getgenv().Config.StandDistance,
-        RightOffset   = getgenv().Config.RightOffset,
-        FlySpeed      = getgenv().Config.FlySpeed,
-        MinDelay      = getgenv().Config.MinDelay,
-        MaxDelay      = getgenv().Config.MaxDelay,
-        SelectedRocks = getgenv().Config.SelectedRocks,
-        ToggleKey     = getgenv().Config.ToggleKey.Name,
-        SkipKey       = getgenv().Config.SkipKey.Name,
-        RotateToRock  = getgenv().Config.RotateToRock,
-        SkipDuration  = getgenv().Config.SkipDuration,
-        StuckTimeout  = getgenv().Config.StuckTimeout,
+        AutoMine         = false,
+        StandDistance    = getgenv().Config.StandDistance,
+        RightOffset      = getgenv().Config.RightOffset,
+        MinDelay         = getgenv().Config.MinDelay,
+        MaxDelay         = getgenv().Config.MaxDelay,
+        SelectedRocks    = getgenv().Config.SelectedRocks,
+        RotateToRock     = getgenv().Config.RotateToRock,
+        SkipDurationRock = getgenv().Config.SkipDurationRock,
+        StuckTimeoutRock = getgenv().Config.StuckTimeoutRock,
+
+        FlyToMob         = getgenv().Config.FlyToMob,
+        MobHeightOffset  = getgenv().Config.MobHeightOffset,
+        MobSideOffset    = getgenv().Config.MobSideOffset,
+        TimeoutDelayMob  = getgenv().Config.TimeoutDelayMob,
+        SkipDurationMob  = getgenv().Config.SkipDurationMob,
+        SelectedMobs     = getgenv().Config.SelectedMobs,
+
+        ToggleKey        = getgenv().Config.ToggleKey.Name,
+        FlySpeed         = getgenv().Config.FlySpeed,
     }
     local success, encoded = pcall(function() return HttpService:JSONEncode(data) end)
     if success then
@@ -63,10 +76,10 @@ local function LoadConfig()
             local decodeSuccess, data = pcall(function() return HttpService:JSONDecode(content) end)
             if decodeSuccess and type(data) == "table" then
                 for k, v in pairs(data) do
-                    if k == "ToggleKey" or k == "SkipKey" then
+                    if k == "ToggleKey" then
                         local key = Enum.KeyCode[v]
                         if key then getgenv().Config[k] = key end
-                    elseif k == "SelectedRocks" then
+                    elseif k == "SelectedRocks" or k == "SelectedMobs" then
                         if type(v) == "table" then getgenv().Config[k] = v end
                     elseif k ~= "AutoMine" then
                         getgenv().Config[k] = v
@@ -75,8 +88,6 @@ local function LoadConfig()
             end
         end
     end
-    
-    -- Force AutoMine to false on load
     getgenv().Config.AutoMine = false
 end
 
@@ -88,9 +99,9 @@ LoadConfig()
 local Connections = {}
 local function Track(conn) table.insert(Connections, conn); return conn end
 
-if getgenv().ForgeMinerLoaded then
+if getgenv().CombinedScriptLoaded then
     pcall(function()
-        if getgenv().ForgeCleanup then getgenv().ForgeCleanup() end
+        if getgenv().CombinedCleanup then getgenv().CombinedCleanup() end
     end)
     task.wait(0.3)
 end
@@ -98,19 +109,77 @@ end
 getgenv().ScriptActive      = true
 getgenv().CurrentScriptTick = tick()
 local MyTick = getgenv().CurrentScriptTick
-getgenv().ForgeMinerLoaded  = true
+getgenv().CombinedScriptLoaded = true
 
-local CurrentTarget  = nil
-local TargetPhase    = "Top" 
 local SavedHumanoid  = {}
+local InitialCollisions = {} -- Stores collision state from script startup
+local CamConnection  = nil
+local AttackTarget   = nil
+
+local CurrentRock    = nil
+local RockPhase      = "Top" 
+local RockStartTime  = 0
 local SkippedRocks   = {}
-local TargetStartTime = 0
-local OriginalCollisions = {}
+
+local CurrentMob     = nil
+local HasArrivedMob  = false
+local MobWaitStartTime = 0
+local SkippedMobs    = {}
 
 local function Alive()
     return getgenv().ScriptActive and getgenv().CurrentScriptTick == MyTick
 end
 
+-- ==========================================
+-- COLLISION SNAPSHOT LOGIC
+-- ==========================================
+local function SnapshotCollisions()
+    local char = LocalPlayer.Character
+    if not char then return end
+    
+    -- Clear old snapshot
+    InitialCollisions = {}
+    
+    -- Save current state of all BaseParts
+    for _, v in ipairs(char:GetDescendants()) do
+        if v:IsA("BasePart") then
+            InitialCollisions[v] = v.CanCollide
+        end
+    end
+end
+
+-- Take snapshot immediately if character exists
+if LocalPlayer.Character then
+    SnapshotCollisions()
+end
+
+-- Take snapshot if character respawns while script is running
+Track(LocalPlayer.CharacterAdded:Connect(function()
+    task.wait(1)
+    SnapshotCollisions()
+end))
+
+local function RestoreCollisions()
+    local char = LocalPlayer.Character
+    if not char then return end
+    
+    for _, v in ipairs(char:GetDescendants()) do
+        if v:IsA("BasePart") then
+            if InitialCollisions[v] ~= nil then
+                -- Restore exactly as it was at the beginning
+                v.CanCollide = InitialCollisions[v]
+            else
+                -- Fallback for newly spawned parts (e.g. tools)
+                -- Body parts default to true, HRP and accessories to false
+                v.CanCollide = (v.Name ~= "HumanoidRootPart") and not v:FindFirstAncestorOfClass("Accessory")
+            end
+        end
+    end
+end
+
+-- ==========================================
+-- SHARED HELPERS
+-- ==========================================
 local function SaveHumanoidState(hum)
     if SavedHumanoid.Saved then return end
     pcall(function()
@@ -141,87 +210,113 @@ local function ToggleNoclip(enabled)
     local char = LocalPlayer.Character
     if not char then return end
     
-    for _, v in ipairs(char:GetDescendants()) do
-        if v:IsA("BasePart") and OriginalCollisions[v] == nil then
-            OriginalCollisions[v] = v.CanCollide
-        end
-    end
-    
-    for _, v in ipairs(char:GetDescendants()) do
-        if v:IsA("BasePart") then
-            if enabled then
+    if enabled then
+        -- Disable collision temporarily
+        for _, v in ipairs(char:GetDescendants()) do
+            if v:IsA("BasePart") then
                 v.CanCollide = false
-            else
-                if OriginalCollisions[v] ~= nil then
-                    v.CanCollide = OriginalCollisions[v]
-                else
-                    v.CanCollide = (v.Name ~= "HumanoidRootPart")
-                end
             end
         end
-    end
-    
-    if not enabled then
-        table.clear(OriginalCollisions)
+    else
+        -- Restore exact snapshot
+        RestoreCollisions()
     end
 end
 
-local function KillRockMovers()
+local function KillMovers()
     local char = LocalPlayer.Character
     if not char then return end
     local hrp = char:FindFirstChild("HumanoidRootPart")
     if not hrp then return end
-    for _, n in ipairs({"MinerFly","MinerFreeze","MinerGyro"}) do
+    for _, n in ipairs({"MinerFly","MinerFreeze","MinerGyro","MobFly","MobGyro"}) do
         local m = hrp:FindFirstChild(n); if m then m:Destroy() end
     end
 end
 
+local function StopCameraLock()
+    if CamConnection then
+        CamConnection:Disconnect()
+        CamConnection = nil
+    end
+    AttackTarget = nil
+    local cam = workspace.CurrentCamera
+    if cam then
+        cam.CameraType = Enum.CameraType.Custom
+    end
+end
+
+-- ==========================================
+-- CLEANUP (Perfect Restoration, Keeps Config)
+-- ==========================================
 local function Cleanup()
+    -- 1. Stop all loops
     getgenv().ScriptActive = false
-    ToggleNoclip(false)
+    
+    -- 2. Restore character physical state
+    ToggleNoclip(false) -- This calls RestoreCollisions
+    StopCameraLock()
 
     local char = LocalPlayer.Character
     if char then
         local hrp = char:FindFirstChild("HumanoidRootPart")
-        if hrp then hrp.Anchored = false end
+        if hrp then 
+            hrp.Anchored = false
+            hrp.AssemblyLinearVelocity = Vector3.zero 
+        end
+        
         local hum = char:FindFirstChildOfClass("Humanoid")
         if hum then
             RestoreHumanoidState(hum)
             hum.PlatformStand = false
+            hum.AutoRotate = true
+            
+            -- Force standard humanoid values if something went wrong
+            if hum.WalkSpeed <= 0 then hum.WalkSpeed = 16 end
+            if hum.JumpPower <= 0 then hum.JumpPower = 50 end
+
             if hum:GetState() == Enum.HumanoidStateType.Physics
                 or hum:GetState() == Enum.HumanoidStateType.Freefall then
                 hum:ChangeState(Enum.HumanoidStateType.GettingUp)
             end
         end
-        KillRockMovers()
+        
+        KillMovers()
     end
 
+    -- 3. Disconnect all events
     for _, c in ipairs(Connections) do pcall(function() c:Disconnect() end) end
     table.clear(Connections)
 
-    CurrentTarget = nil
-    SkippedRocks  = {}
-    if getgenv().ForgeUI then getgenv().ForgeUI:Destroy(); getgenv().ForgeUI = nil end
+    -- 4. Destroy UI
+    if getgenv().CombinedUI then 
+        getgenv().CombinedUI:Destroy() 
+        getgenv().CombinedUI = nil 
+    end
+    
+    -- 5. Clear specific flags but KEEP Config
+    getgenv().CurrentScriptTick = nil
+    getgenv().CombinedScriptLoaded = nil
+    getgenv().CombinedCleanup = nil
+    getgenv().Noclip = nil
+    
+    print("[The Forge] Script stopped. Collisions restored to startup snapshot. Config saved.")
 end
-getgenv().ForgeCleanup = Cleanup
+getgenv().CombinedCleanup = Cleanup
 
 -- ==========================================
--- TOOL ACTIVATION
+-- MINING HELPERS
 -- ==========================================
-local function ActivateTool()
-    pcall(function()
-        if typeof(mouse1click) == "function" then 
-            mouse1click() 
-        elseif typeof(VirtualUser) == "table" then
-            VirtualUser:CaptureController()
-            VirtualUser:ClickButton1(Vector2.new(0,0))
-        end
-    end)
-end
+local ToolActivate
+pcall(function()
+    local Shared = ReplicatedStorage:WaitForChild("Shared", 5)
+    local PK     = Shared and Shared:FindFirstChild("Packages")
+    local Knit   = PK and PK:FindFirstChild("Knit")
+    local Svc    = Knit and Knit:FindFirstChild("Services")
+    local TS     = Svc and Svc:FindFirstChild("ToolService")
+    local RF     = TS and TS:FindFirstChild("RF")
+    ToolActivate = RF and RF:FindFirstChild("ToolActivated")
+end)
 
--- ==========================================
--- ROCK HELPERS
--- ==========================================
 local function GetRockHP(Hitbox)
     local Model = Hitbox:FindFirstAncestorWhichIsA("Model")
     if not Model then return nil end
@@ -241,7 +336,7 @@ local function IsMineableRock(Hitbox)
     return Model:FindFirstChild("infoFrame", true) ~= nil
 end
 
-local function GetLookPos(Hitbox, phase)
+local function GetRockLookPos(Hitbox, phase)
     if phase == "Top" then
         return Hitbox.Position + Vector3.new(0, Hitbox.Size.Y / 2, 0)
     else
@@ -249,8 +344,8 @@ local function GetLookPos(Hitbox, phase)
     end
 end
 
-local function GetStandPos(Hitbox, phase)
-    local lookPos = GetLookPos(Hitbox, phase)
+local function GetRockStandPos(Hitbox, phase)
+    local lookPos = GetRockLookPos(Hitbox, phase)
     local rightVec = Hitbox.CFrame.RightVector
     local offsetPos = lookPos + (rightVec * getgenv().Config.RightOffset)
     
@@ -258,29 +353,17 @@ local function GetStandPos(Hitbox, phase)
     return offsetPos + Vector3.new(0, yOffset, 0) + Vector3.new(0.1, 0, 0.1)
 end
 
-local function IsSkipped(hitbox)
+local function IsRockSkipped(hitbox)
     local model = hitbox:FindFirstAncestorWhichIsA("Model")
     if not model then return false end
     if not model.Parent then SkippedRocks[model] = nil; return false end
     local t = SkippedRocks[model]
     if not t then return false end
-    if tick() - t > getgenv().Config.SkipDuration then
+    if tick() - t > getgenv().Config.SkipDurationRock then
         SkippedRocks[model] = nil
         return false
     end
     return true
-end
-
-local function CountSkipped()
-    local n = 0
-    for model, t in pairs(SkippedRocks) do
-        if not model.Parent or tick() - t > getgenv().Config.SkipDuration then
-            SkippedRocks[model] = nil
-        else
-            n = n + 1
-        end
-    end
-    return n
 end
 
 local function RockMatches(hitbox)
@@ -293,72 +376,101 @@ local function RockMatches(hitbox)
     return false
 end
 
-local function ScanRockTypesInWorld()
-    local types, total = {}, 0
+local function FindClosestRock(HRP)
+    local closest, bestDist = nil, math.huge
     for _, obj in ipairs(workspace:GetDescendants()) do
         if obj.Name == "Hitbox" and obj:IsA("BasePart") and IsMineableRock(obj) then
-            local model = obj:FindFirstAncestorWhichIsA("Model")
-            if model then
-                local base = model.Name
-                    :gsub("%s*%b()$", "")
-                    :gsub("%s*%d+$", "")
-                    :gsub("^%s+", ""):gsub("%s+$", "")
-                if base ~= "" then
-                    types[base] = (types[base] or 0) + 1
-                    total = total + 1
+            if RockMatches(obj) and not IsRockSkipped(obj) then
+                local hp = GetRockHP(obj)
+                if hp and hp > 0 then
+                    local standPos = GetRockStandPos(obj, "Bottom")
+                    local dist = (HRP.Position - standPos).Magnitude
+                    if dist < bestDist then
+                        closest = obj
+                        bestDist = dist
+                    end
                 end
             end
         end
     end
-    return types, total
+    return closest, bestDist
+end
+
+local function ActivateMiningTool()
+    if ToolActivate then 
+        pcall(function() ToolActivate:InvokeServer() end) 
+    end
+    pcall(function()
+        if typeof(mouse1click) == "function" then 
+            mouse1click() 
+        end
+    end)
 end
 
 -- ==========================================
--- NOCLIP + CACHE LOOPS
+-- MOB HELPERS
 -- ==========================================
-task.spawn(function()
-    while Alive() do
-        task.wait(1)
-        if getgenv().Noclip and LocalPlayer.Character then
-            local char = LocalPlayer.Character
-            for _, v in ipairs(char:GetDescendants()) do
-                if v:IsA("BasePart") then
-                    if OriginalCollisions[v] == nil then
-                        OriginalCollisions[v] = v.CanCollide
-                    end
-                    v.CanCollide = false
+local function IsEnemyAlive(model)
+    if not model or not model.Parent then return false end
+    if not model:IsA("Model") then return false end
+    if model == LocalPlayer.Character then return false end
+    
+    local hum = model:FindFirstChildOfClass("Humanoid")
+    local root = model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart
+    
+    if hum and root and hum.Health > 0 then
+        if not Players:GetPlayerFromCharacter(model) then
+            return true
+        end
+    end
+    return false
+end
+
+local function IsMobSkipped(mob)
+    if not mob then return false end
+    if not mob.Parent then SkippedMobs[mob] = nil; return false end
+    local t = SkippedMobs[mob]
+    if not t then return false end
+    if tick() - t > getgenv().Config.SkipDurationMob then
+        SkippedMobs[mob] = nil
+        return false
+    end
+    return true
+end
+
+local function MobMatches(mob)
+    if #getgenv().Config.SelectedMobs == 0 then return false end
+    for _, sel in ipairs(getgenv().Config.SelectedMobs) do
+        if mob.Name:find(sel, 1, true) then return true end
+    end
+    return false
+end
+
+local function FindClosestMob(HRP)
+    local closest, bestDist = nil, math.huge
+    for _, model in ipairs(workspace:GetDescendants()) do
+        if IsEnemyAlive(model) and MobMatches(model) and not IsMobSkipped(model) then
+            local root = model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart
+            if root then
+                local dist = (HRP.Position - root.Position).Magnitude
+                if dist < bestDist then
+                    closest = model
+                    bestDist = dist
                 end
             end
         end
     end
-end)
-
-Track(LocalPlayer.CharacterAdded:Connect(function()
-    task.wait(0.5); if getgenv().Noclip then ToggleNoclip(true) end
-end))
-
-local HitboxCache = {}
-task.spawn(function()
-    while Alive() do
-        local newCache = {}
-        for _, obj in ipairs(workspace:GetDescendants()) do
-            if obj.Name == "Hitbox" and obj:IsA("BasePart") and IsMineableRock(obj) then
-                table.insert(newCache, obj)
-            end
-        end
-        HitboxCache = newCache
-        task.wait(0.7)
-    end
-end)
+    return closest, bestDist
+end
 
 -- ==========================================
--- UI
+-- UI CREATION
 -- ==========================================
 local ScreenGui = Instance.new("ScreenGui")
-ScreenGui.Name = "ForgeMinerModernUI"
+ScreenGui.Name = "ForgeCombinedUI"
 ScreenGui.ResetOnSpawn = false
 ScreenGui.Parent = LocalPlayer:WaitForChild("PlayerGui")
-getgenv().ForgeUI = ScreenGui
+getgenv().CombinedUI = ScreenGui
 
 local MainFrame = Instance.new("Frame")
 MainFrame.Size = UDim2.new(0, 520, 0, 450)
@@ -381,7 +493,7 @@ local Title = Instance.new("TextLabel")
 Title.Size = UDim2.new(1, -100, 1, 0)
 Title.Position = UDim2.new(0, 15, 0, 0)
 Title.BackgroundTransparency = 1
-Title.Text = "The Forge | Auto Miner V53"
+Title.Text = "The Forge | Combined Script"
 Title.TextColor3 = Color3.fromRGB(255, 255, 255)
 Title.Font = Enum.Font.GothamBold
 Title.TextSize = 14
@@ -418,6 +530,7 @@ ContentArea.Position = UDim2.new(0, 130, 0, 35)
 ContentArea.BackgroundTransparency = 1
 ContentArea.Parent = MainFrame
 
+-- Helpers
 local function CreateTabButton(name, order)
     local B = Instance.new("TextButton")
     B.Size = UDim2.new(0, 110, 0, 35)
@@ -432,52 +545,27 @@ local function CreateTabButton(name, order)
     return B
 end
 
-local HomeTabBtn     = CreateTabButton("Home", 1)
-local SettingsTabBtn = CreateTabButton("Settings", 2)
+local function CreateStatusBox(parent, order)
+    local Frame = Instance.new("Frame")
+    Frame.Size = UDim2.new(1, 0, 0, 40)
+    Frame.BackgroundColor3 = Color3.fromRGB(30, 30, 35)
+    Frame.LayoutOrder = order
+    Frame.Parent = parent
+    Instance.new("UICorner", Frame).CornerRadius = UDim.new(0, 4)
 
-local HomeTab = Instance.new("ScrollingFrame")
-HomeTab.Size = UDim2.new(1, -20, 1, -10)
-HomeTab.Position = UDim2.new(0, 10, 0, 5)
-HomeTab.BackgroundTransparency = 1
-HomeTab.ScrollBarThickness = 2
-HomeTab.ScrollBarImageColor3 = Color3.fromRGB(100, 100, 120)
-HomeTab.Parent = ContentArea
-Instance.new("UIListLayout", HomeTab).Padding = UDim.new(0, 10)
-
-local function CreateSectionLabel(text, parent, order)
-    local L = Instance.new("TextLabel")
-    L.Size = UDim2.new(1, -20, 0, 20)
-    L.BackgroundTransparency = 1
-    L.Text = text
-    L.TextColor3 = Color3.fromRGB(100, 100, 120)
-    L.Font = Enum.Font.GothamBold
-    L.TextSize = 11
-    L.TextXAlignment = Enum.TextXAlignment.Left
-    L.LayoutOrder = order
-    L.Parent = parent
-    return L
+    local Label = Instance.new("TextLabel")
+    Label.Size = UDim2.new(1, -16, 1, -8)
+    Label.Position = UDim2.new(0, 8, 0, 4)
+    Label.BackgroundTransparency = 1
+    Label.Text = "Status: Idle"
+    Label.TextColor3 = Color3.fromRGB(180, 220, 255)
+    Label.Font = Enum.Font.Code
+    Label.TextSize = 12
+    Label.TextXAlignment = Enum.TextXAlignment.Left
+    Label.TextYAlignment = Enum.TextYAlignment.Top
+    Label.Parent = Frame
+    return Label
 end
-
-local StatusFrame = Instance.new("Frame")
-StatusFrame.Size = UDim2.new(1, 0, 0, 60)
-StatusFrame.BackgroundColor3 = Color3.fromRGB(30, 30, 35)
-StatusFrame.LayoutOrder = 0
-StatusFrame.Parent = HomeTab
-Instance.new("UICorner", StatusFrame).CornerRadius = UDim.new(0, 6)
-
-local StatusLabel = Instance.new("TextLabel")
-StatusLabel.Size = UDim2.new(1, -16, 1, -8)
-StatusLabel.Position = UDim2.new(0, 8, 0, 4)
-StatusLabel.BackgroundTransparency = 1
-StatusLabel.Text = "Loading..."
-StatusLabel.TextColor3 = Color3.fromRGB(180, 220, 255)
-StatusLabel.Font = Enum.Font.Code
-StatusLabel.TextSize = 12
-StatusLabel.TextXAlignment = Enum.TextXAlignment.Left
-StatusLabel.TextYAlignment = Enum.TextYAlignment.Top
-StatusLabel.Parent = StatusFrame
-
-local function SetStatus(txt) StatusLabel.Text = txt end
 
 local function CreateToggle(parent, text, default, order, callback)
     local C = Instance.new("Frame")
@@ -512,15 +600,21 @@ local function CreateToggle(parent, text, default, order, callback)
     Instance.new("UICorner", Knob).CornerRadius = UDim.new(1, 0)
 
     local state = default
-    Btn.MouseButton1Click:Connect(function()
-        state = not state
+    local function setVisual(newState, skipCallback)
+        state = newState
         TweenService:Create(Btn, TweenInfo.new(0.2),
             {BackgroundColor3 = state and Color3.fromRGB(60,120,200) or Color3.fromRGB(50,50,60)}):Play()
         TweenService:Create(Knob, TweenInfo.new(0.2),
             {Position = state and UDim2.new(1,-18,0.5,-8) or UDim2.new(0,2,0.5,-8)}):Play()
-        callback(state)
+        if not skipCallback then callback(state) end
+    end
+
+    Btn.MouseButton1Click:Connect(function()
+        setVisual(not state, false)
         SaveConfig()
     end)
+
+    return { Button = Btn, Knob = Knob, Set = setVisual }
 end
 
 local function CreateInput(parent, text, default, order, callback)
@@ -550,12 +644,9 @@ local function CreateInput(parent, text, default, order, callback)
     Box.Text = tostring(default)
     Box.Parent = C
     Instance.new("UICorner", Box).CornerRadius = UDim.new(0, 4)
-    
-    local BoxStroke = Instance.new("UIStroke")
-    BoxStroke.Color = Color3.fromRGB(70, 70, 80)
-    BoxStroke.Parent = Box
+    Instance.new("UIStroke", Box).Color = Color3.fromRGB(70, 70, 80)
 
-    Box.FocusLost:Connect(function(enterPressed)
+    Box.FocusLost:Connect(function()
         local val = tonumber(Box.Text)
         if not val then val = default end
         Box.Text = tostring(val)
@@ -564,11 +655,83 @@ local function CreateInput(parent, text, default, order, callback)
     end)
 end
 
-CreateSectionLabel("MAIN SETTINGS", HomeTab, 1)
+local function CreateButton(parent, text, order, callback)
+    local Btn = Instance.new("TextButton")
+    Btn.Size = UDim2.new(1, 0, 0, 35)
+    Btn.BackgroundColor3 = Color3.fromRGB(50, 50, 60)
+    Btn.Text = text
+    Btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    Btn.Font = Enum.Font.GothamSemibold
+    Btn.TextSize = 14
+    Btn.LayoutOrder = order
+    Btn.Parent = parent
+    Instance.new("UICorner", Btn).CornerRadius = UDim.new(0, 6)
+    Btn.MouseButton1Click:Connect(callback)
+    return Btn
+end
 
-CreateToggle(HomeTab, "Auto-Mine", getgenv().Config.AutoMine, 2, function(s)
+local function CreateList(parent, height, order)
+    local Frame = Instance.new("Frame")
+    Frame.Size = UDim2.new(1, 0, 0, height)
+    Frame.BackgroundColor3 = Color3.fromRGB(30, 30, 35)
+    Frame.LayoutOrder = order
+    Frame.Parent = parent
+    Instance.new("UICorner", Frame).CornerRadius = UDim.new(0, 6)
+
+    local Scroll = Instance.new("ScrollingFrame")
+    Scroll.Size = UDim2.new(1, -10, 1, -10)
+    Scroll.Position = UDim2.new(0, 5, 0, 5)
+    Scroll.BackgroundTransparency = 1
+    Scroll.ScrollBarThickness = 2
+    Scroll.ScrollBarImageColor3 = Color3.fromRGB(60, 120, 200)
+    Scroll.Parent = Frame
+    Instance.new("UIListLayout", Scroll).Padding = UDim.new(0, 5)
+    return Scroll
+end
+
+-- ==========================================
+-- BUILD TABS
+-- ==========================================
+local TabMiningBtn = CreateTabButton("Mining", 1)
+local TabMobsBtn   = CreateTabButton("Mobs", 2)
+local TabSettingsBtn = CreateTabButton("Settings", 3)
+
+-- 1. MINING TAB
+local MiningTab = Instance.new("ScrollingFrame")
+MiningTab.Size = UDim2.new(1, -20, 1, -10)
+MiningTab.Position = UDim2.new(0, 10, 0, 5)
+MiningTab.BackgroundTransparency = 1
+MiningTab.ScrollBarThickness = 2
+MiningTab.ScrollBarImageColor3 = Color3.fromRGB(100, 100, 120)
+MiningTab.Parent = ContentArea
+Instance.new("UIListLayout", MiningTab).Padding = UDim.new(0, 10)
+
+local MineStatusLabel = CreateStatusBox(MiningTab, 1)
+local MineToggle, MobToggle
+
+MineToggle = CreateToggle(MiningTab, "Auto-Mine", getgenv().Config.AutoMine, 2, function(s)
     getgenv().Config.AutoMine = s
-    if not s then
+    if s then
+        if getgenv().Config.FlyToMob then
+            MobToggle.Set(false, true)
+            getgenv().Config.FlyToMob = false
+            CurrentMob = nil
+            HasArrivedMob = false
+            ToggleNoclip(false)
+            UnanchorRoot()
+            local char = LocalPlayer.Character
+            if char then
+                local hum = char:FindFirstChildOfClass("Humanoid")
+                if hum then
+                    RestoreHumanoidState(hum)
+                    hum.PlatformStand = false
+                end
+            end
+            KillMovers()
+        end
+    else
+        CurrentRock = nil
+        StopCameraLock()
         ToggleNoclip(false)
         UnanchorRoot()
         local char = LocalPlayer.Character
@@ -578,248 +741,35 @@ CreateToggle(HomeTab, "Auto-Mine", getgenv().Config.AutoMine, 2, function(s)
                 RestoreHumanoidState(hum)
                 hum.PlatformStand = false
             end
-            KillRockMovers()
         end
-        CurrentTarget = nil
+        KillMovers()
     end
 end)
 
-CreateToggle(HomeTab, "Aim Camera at Rock", getgenv().Config.RotateToRock, 3, function(s)
-    getgenv().Config.RotateToRock = s
-    CurrentTarget = nil
+CreateToggle(MiningTab, "Aim Camera", getgenv().Config.RotateToRock, 3, function(s) getgenv().Config.RotateToRock = s end)
+CreateInput(MiningTab, "Swing Delay (ms)", math.floor(getgenv().Config.MinDelay * 1000), 4, function(v)
+    getgenv().Config.MinDelay = v / 1000
+    getgenv().Config.MaxDelay = (v + 100) / 1000
 end)
+CreateInput(MiningTab, "Stuck Timeout (s)", getgenv().Config.StuckTimeoutRock, 5, function(v) getgenv().Config.StuckTimeoutRock = v end)
+CreateInput(MiningTab, "Skip Duration (s)", getgenv().Config.SkipDurationRock, 6, function(v) getgenv().Config.SkipDurationRock = v end)
 
-CreateInput(HomeTab, "Fly Speed", getgenv().Config.FlySpeed, 4,
-    function(v) getgenv().Config.FlySpeed = v end)
-    
-CreateInput(HomeTab, "Depth Under Rock", getgenv().Config.StandDistance, 5,
-    function(v) getgenv().Config.StandDistance = v; CurrentTarget = nil end)
-    
-CreateInput(HomeTab, "Right Offset", getgenv().Config.RightOffset, 6,
-    function(v) getgenv().Config.RightOffset = v; CurrentTarget = nil end)
-    
-CreateInput(HomeTab, "Swing Delay (ms)", math.floor(getgenv().Config.MinDelay * 1000), 7,
-    function(v)
-        getgenv().Config.MinDelay = v / 1000
-        getgenv().Config.MaxDelay = (v + 100) / 1000
-    end)
-
-CreateInput(HomeTab, "Stuck Timeout (0=Off)", getgenv().Config.StuckTimeout, 8,
-    function(v) getgenv().Config.StuckTimeout = v end)
-
-local RescanBtn = Instance.new("TextButton")
-RescanBtn.Size = UDim2.new(1, 0, 0, 35)
-RescanBtn.BackgroundColor3 = Color3.fromRGB(50, 50, 60)
-RescanBtn.Text = "Rescan World"
-RescanBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-RescanBtn.Font = Enum.Font.GothamSemibold
-RescanBtn.TextSize = 14
-RescanBtn.LayoutOrder = 9
-RescanBtn.Parent = HomeTab
-Instance.new("UICorner", RescanBtn).CornerRadius = UDim.new(0, 6)
-
-local SkipBtn = Instance.new("TextButton")
-SkipBtn.Size = UDim2.new(1, 0, 0, 40)
-SkipBtn.BackgroundColor3 = Color3.fromRGB(180, 60, 60)
-SkipBtn.Text = string.format("Skip Current Rock  [%s]", getgenv().Config.SkipKey.Name)
-SkipBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-SkipBtn.Font = Enum.Font.GothamBold
-SkipBtn.TextSize = 14
-SkipBtn.LayoutOrder = 10
-SkipBtn.Parent = HomeTab
-Instance.new("UICorner", SkipBtn).CornerRadius = UDim.new(0, 6)
-
-CreateSectionLabel("DETECTED ROCKS", HomeTab, 11)
-
-local RockListFrame = Instance.new("Frame")
-RockListFrame.Size = UDim2.new(1, 0, 0, 150)
-RockListFrame.BackgroundColor3 = Color3.fromRGB(30, 30, 35)
-RockListFrame.LayoutOrder = 12
-RockListFrame.Parent = HomeTab
-Instance.new("UICorner", RockListFrame).CornerRadius = UDim.new(0, 6)
-
-local RockList = Instance.new("ScrollingFrame")
-RockList.Size = UDim2.new(1, -10, 1, -10)
-RockList.Position = UDim2.new(0, 5, 0, 5)
-RockList.BackgroundTransparency = 1
-RockList.ScrollBarThickness = 2
-RockList.ScrollBarImageColor3 = Color3.fromRGB(60, 120, 200)
-RockList.Parent = RockListFrame
-Instance.new("UIListLayout", RockList).Padding = UDim.new(0, 5)
-
--- === Settings ===
-local SettingsTab = Instance.new("Frame")
-SettingsTab.Size = UDim2.new(1, -20, 1, -10)
-SettingsTab.Position = UDim2.new(0, 10, 0, 5)
-SettingsTab.BackgroundTransparency = 1
-SettingsTab.Visible = false
-SettingsTab.Parent = ContentArea
-Instance.new("UIListLayout", SettingsTab).Padding = UDim.new(0, 10)
-
-CreateSectionLabel("SKIP ROCK", SettingsTab, 1)
-
-CreateInput(SettingsTab, "Skip Duration (s)", getgenv().Config.SkipDuration, 2,
-    function(v) getgenv().Config.SkipDuration = v end)
-
-local SkipKeyBox = Instance.new("TextButton")
-SkipKeyBox.Size = UDim2.new(1, 0, 0, 35)
-SkipKeyBox.BackgroundColor3 = Color3.fromRGB(30, 30, 35)
-SkipKeyBox.Text = "Skip Key: " .. getgenv().Config.SkipKey.Name
-SkipKeyBox.TextColor3 = Color3.fromRGB(255, 255, 255)
-SkipKeyBox.Font = Enum.Font.GothamSemibold
-SkipKeyBox.TextSize = 14
-SkipKeyBox.LayoutOrder = 3
-SkipKeyBox.Parent = SettingsTab
-Instance.new("UICorner", SkipKeyBox).CornerRadius = UDim.new(0, 6)
-
-CreateSectionLabel("MENU TOGGLE KEYBIND", SettingsTab, 4)
-
-local KeyBox = Instance.new("TextButton")
-KeyBox.Size = UDim2.new(1, 0, 0, 35)
-KeyBox.BackgroundColor3 = Color3.fromRGB(30, 30, 35)
-KeyBox.Text = getgenv().Config.ToggleKey.Name
-KeyBox.TextColor3 = Color3.fromRGB(255, 255, 255)
-KeyBox.Font = Enum.Font.GothamSemibold
-KeyBox.TextSize = 14
-KeyBox.LayoutOrder = 5
-KeyBox.Parent = SettingsTab
-Instance.new("UICorner", KeyBox).CornerRadius = UDim.new(0, 6)
-
-local isBinding     = false
-local bindMode      = nil
-
-KeyBox.MouseButton1Click:Connect(function()
-    if not isBinding then
-        isBinding = true; bindMode = "toggle"
-        KeyBox.Text = "Press any key..."
-    end
-end)
-
-SkipKeyBox.MouseButton1Click:Connect(function()
-    if not isBinding then
-        isBinding = true; bindMode = "skip"
-        SkipKeyBox.Text = "Press any key..."
-    end
-end)
-
-local StopBtn = Instance.new("TextButton")
-StopBtn.Size = UDim2.new(1, 0, 0, 40)
-StopBtn.BackgroundColor3 = Color3.fromRGB(200, 50, 50)
-StopBtn.Text = "STOP SCRIPT"
-StopBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-StopBtn.Font = Enum.Font.GothamBold
-StopBtn.TextSize = 14
-StopBtn.LayoutOrder = 6
-StopBtn.Parent = SettingsTab
-Instance.new("UICorner", StopBtn).CornerRadius = UDim.new(0, 6)
-
-local function SetTab(aB, aT, iB, iT)
-    aB.BackgroundColor3 = Color3.fromRGB(60, 120, 200)
-    aB.TextColor3 = Color3.fromRGB(255, 255, 255)
-    iB.BackgroundColor3 = Color3.fromRGB(35, 35, 40)
-    iB.TextColor3 = Color3.fromRGB(180, 180, 180)
-    aT.Visible = true; iT.Visible = false
-end
-HomeTabBtn.MouseButton1Click:Connect(function() SetTab(HomeTabBtn, HomeTab, SettingsTabBtn, SettingsTab) end)
-SettingsTabBtn.MouseButton1Click:Connect(function() SetTab(SettingsTabBtn, SettingsTab, HomeTabBtn, HomeTab) end)
-
-StopBtn.MouseButton1Click:Connect(Cleanup)
-
--- ==========================================
--- SKIP LOGIC
--- ==========================================
-local function SkipCurrentRock()
-    local skippedAny = false
-
-    if CurrentTarget and CurrentTarget.Parent then
-        local model = CurrentTarget:FindFirstAncestorWhichIsA("Model")
-        if model then
-            SkippedRocks[model] = tick()
-            skippedAny = true
-        end
-    end
-
-    if not skippedAny then
-        local char = LocalPlayer.Character
-        if char then
-            local root = char:FindFirstChild("HumanoidRootPart")
-            if root then
-                local closest = nil
-                local minDist = math.huge
-                for _, hitbox in ipairs(HitboxCache) do
-                    if hitbox.Parent and RockMatches(hitbox) and not IsSkipped(hitbox) then
-                        local d = (root.Position - hitbox.Position).Magnitude
-                        local hp = GetRockHP(hitbox)
-                        if hp and hp > 0 then
-                            if d < minDist then closest, minDist = hitbox, d end
-                        end
-                    end
-                end
-                if closest then
-                    local model = closest:FindFirstAncestorWhichIsA("Model")
-                    if model then
-                        SkippedRocks[model] = tick()
-                        skippedAny = true
-                    end
-                end
+local RockList = CreateList(MiningTab, 150, 8)
+CreateButton(MiningTab, "Rescan Rocks", 7, function()
+    local types, total = {}, 0
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        if obj.Name == "Hitbox" and obj:IsA("BasePart") and IsMineableRock(obj) then
+            local model = obj:FindFirstAncestorWhichIsA("Model")
+            if model then
+                local base = model.Name:gsub("%s*%b()$", ""):gsub("%s*%d+$", ""):gsub("^%s+", ""):gsub("%s+$", "")
+                if base ~= "" then types[base] = (types[base] or 0) + 1; total = total + 1 end
             end
         end
     end
-
-    CurrentTarget = nil
-    UnanchorRoot()
-    KillRockMovers()
-
-    local char = LocalPlayer.Character
-    if char then
-        local hum = char:FindFirstChildOfClass("Humanoid")
-        if hum then
-            hum.PlatformStand = false
-            RestoreHumanoidState(hum)
-        end
-    end
-
-    SetStatus(skippedAny
-        and string.format("Skipped. Total skipped: %d", CountSkipped())
-        or "Nothing to skip")
-end
-
-SkipBtn.MouseButton1Click:Connect(SkipCurrentRock)
-
-Track(UserInputService.InputBegan:Connect(function(input, gp)
-    if isBinding then
-        if input.KeyCode ~= Enum.KeyCode.Unknown then
-            if bindMode == "toggle" then
-                getgenv().Config.ToggleKey = input.KeyCode
-                KeyBox.Text = input.KeyCode.Name
-            elseif bindMode == "skip" then
-                getgenv().Config.SkipKey = input.KeyCode
-                SkipKeyBox.Text = "Skip Key: " .. input.KeyCode.Name
-                SkipBtn.Text = string.format("Skip Current Rock  [%s]", input.KeyCode.Name)
-            end
-            isBinding = false
-            bindMode = nil
-            SaveConfig()
-        end
-    elseif not gp then
-        local focused = false
-        pcall(function() focused = UserInputService:GetFocusedTextBox() ~= nil end)
-        if not focused then
-            if input.KeyCode == getgenv().Config.ToggleKey then
-                MainFrame.Visible = not MainFrame.Visible
-            elseif input.KeyCode == getgenv().Config.SkipKey then
-                SkipCurrentRock()
-            end
-        end
-    end
-end))
-
--- ==========================================
--- AUTO ROCK LIST
--- ==========================================
-local function RefreshRockList(types, total)
-    if not RockList then return end
-
+    local names = {}
+    for n in pairs(types) do table.insert(names, n) end
+    table.sort(names)
+    
     for _, ch in ipairs(RockList:GetChildren()) do
         if ch:IsA("TextButton") or ch:IsA("TextLabel") then ch:Destroy() end
     end
@@ -828,48 +778,29 @@ local function RefreshRockList(types, total)
         local L = Instance.new("TextLabel")
         L.Size = UDim2.new(1, 0, 0, 40)
         L.BackgroundTransparency = 1
-        L.Text = "No ores found.\nMove closer and click Rescan."
+        L.Text = "No rocks found."
         L.TextColor3 = Color3.fromRGB(200, 120, 120)
-        L.Font = Enum.Font.Gotham
-        L.TextSize = 13
-        L.TextWrapped = true
         L.Parent = RockList
-        RockList.CanvasSize = UDim2.new(0, 0, 0, 60)
         return
     end
 
-    local names = {}
-    for name in pairs(types) do table.insert(names, name) end
-    table.sort(names)
-
     local existing = {}
     for _, n in ipairs(names) do existing[n] = true end
-    
-    local changed = false
     for i = #getgenv().Config.SelectedRocks, 1, -1 do
-        if not existing[getgenv().Config.SelectedRocks[i]] then
-            table.remove(getgenv().Config.SelectedRocks, i)
-            changed = true
-        end
+        if not existing[getgenv().Config.SelectedRocks[i]] then table.remove(getgenv().Config.SelectedRocks, i) end
     end
-    if changed then SaveConfig() end
 
     local function selected(name)
-        for _, n in ipairs(getgenv().Config.SelectedRocks) do
-            if n == name then return true end
-        end
+        for _, n in ipairs(getgenv().Config.SelectedRocks) do if n == name then return true end end
         return false
     end
 
     for i, n in ipairs(names) do
         local on = selected(n)
         local Btn = Instance.new("TextButton")
-        if not Btn then return end
         Btn.Size = UDim2.new(1, 0, 0, 25)
         Btn.BackgroundColor3 = on and Color3.fromRGB(60, 120, 200) or Color3.fromRGB(50, 50, 60)
-        
-        Btn.Text = string.format("%s  %s", n, on and "ON" or "OFF")
-        
+        Btn.Text = string.format("%s %s", n, on and "ON" or "OFF")
         Btn.TextColor3 = Color3.fromRGB(255, 255, 255)
         Btn.Font = Enum.Font.Gotham
         Btn.TextSize = 13
@@ -886,246 +817,410 @@ local function RefreshRockList(types, total)
                 end
             end
             if removed then
-                Btn.Text = string.format("%s  OFF", n)
+                Btn.Text = string.format("%s OFF", n)
                 Btn.BackgroundColor3 = Color3.fromRGB(50, 50, 60)
             else
                 table.insert(getgenv().Config.SelectedRocks, n)
-                Btn.Text = string.format("%s  ON", n)
+                Btn.Text = string.format("%s ON", n)
                 Btn.BackgroundColor3 = Color3.fromRGB(60, 120, 200)
             end
-            CurrentTarget = nil
+            CurrentRock = nil
             SaveConfig()
         end)
     end
     RockList.CanvasSize = UDim2.new(0, 0, 0, #names * 30)
-end
+    MineStatusLabel.Text = string.format("Loaded %d rock types.", #names)
+end)
 
-local function DoRescan()
-    local types, total = ScanRockTypesInWorld()
-    RefreshRockList(types, total)
-    local tc = 0; for _ in pairs(types) do tc = tc + 1 end
-    
-    SetStatus(string.format("Types: %d | Selected: %d", tc, #getgenv().Config.SelectedRocks))
-    print(string.format("[Forge V53] Detected %d types", tc))
-end
+-- 2. MOBS TAB
+local MobsTab = Instance.new("ScrollingFrame")
+MobsTab.Size = UDim2.new(1, -20, 1, -10)
+MobsTab.Position = UDim2.new(0, 10, 0, 5)
+MobsTab.BackgroundTransparency = 1
+MobsTab.ScrollBarThickness = 2
+MobsTab.ScrollBarImageColor3 = Color3.fromRGB(100, 100, 120)
+MobsTab.Visible = false
+MobsTab.Parent = ContentArea
+Instance.new("UIListLayout", MobsTab).Padding = UDim.new(0, 10)
 
-if RescanBtn then
-    RescanBtn.MouseButton1Click:Connect(DoRescan)
-end
+local MobStatusLabel = CreateStatusBox(MobsTab, 1)
 
-task.spawn(function()
-    local lastFP = nil
-    while Alive() do
-        task.wait(5)
-        CountSkipped()
-        local types, total = ScanRockTypesInWorld()
-        local fpParts = {}
-        for n in pairs(types) do table.insert(fpParts, n) end
-        table.sort(fpParts)
-        local fp = table.concat(fpParts, "|")
-        if fp ~= lastFP then
-            lastFP = fp
-            RefreshRockList(types, total)
-            local tc = 0; for _ in pairs(types) do tc = tc + 1 end
-            
-            SetStatus(string.format("Auto-scan: types %d, selected %d", tc, #getgenv().Config.SelectedRocks))
-            print("[Forge V53] Auto-rescan triggered")
+MobToggle = CreateToggle(MobsTab, "Auto Mobs", getgenv().Config.FlyToMob, 2, function(s)
+    getgenv().Config.FlyToMob = s
+    if s then
+        if getgenv().Config.AutoMine then
+            MineToggle.Set(false, true)
+            getgenv().Config.AutoMine = false
+            CurrentRock = nil
+            StopCameraLock()
+            ToggleNoclip(false)
+            UnanchorRoot()
+            local char = LocalPlayer.Character
+            if char then
+                local hum = char:FindFirstChildOfClass("Humanoid")
+                if hum then
+                    RestoreHumanoidState(hum)
+                    hum.PlatformStand = false
+                end
+            end
+            KillMovers()
         end
+    else
+        CurrentMob = nil
+        HasArrivedMob = false
+        ToggleNoclip(false)
+        UnanchorRoot()
+        local char = LocalPlayer.Character
+        if char then
+            local hum = char:FindFirstChildOfClass("Humanoid")
+            if hum then
+                RestoreHumanoidState(hum)
+                hum.PlatformStand = false
+            end
+        end
+        KillMovers()
     end
 end)
 
-DoRescan()
+CreateInput(MobsTab, "Height Offset", getgenv().Config.MobHeightOffset, 3, function(v) getgenv().Config.MobHeightOffset = v end)
+CreateInput(MobsTab, "Timeout Delay (s)", getgenv().Config.TimeoutDelayMob, 4, function(v) getgenv().Config.TimeoutDelayMob = v end)
+CreateInput(MobsTab, "Skip Duration (s)", getgenv().Config.SkipDurationMob, 5, function(v) getgenv().Config.SkipDurationMob = v end)
 
--- ==========================================
--- FIND / FLY / MINE
--- ==========================================
-local function FindClosestRock(Root)
-    local closest, bestTargetDist = nil, math.huge
-    for _, hitbox in ipairs(HitboxCache) do
-        if hitbox.Parent and RockMatches(hitbox) and not IsSkipped(hitbox) then
-            local hp = GetRockHP(hitbox)
-            if hp and hp > 0 then
-                local standPos = GetStandPos(hitbox, "Bottom")
-                local targetDist = (Root.Position - standPos).Magnitude
-                if targetDist < bestTargetDist then
-                    closest, bestTargetDist = hitbox, targetDist
-                end
-            end
+local MobList = CreateList(MobsTab, 150, 7)
+CreateButton(MobsTab, "Rescan Mobs", 6, function()
+    local types, total = {}, 0
+    for _, model in ipairs(workspace:GetDescendants()) do
+        if IsEnemyAlive(model) then
+            local base = model.Name:gsub("%s*%b()$", ""):gsub("%s*%d+$", ""):gsub("^%s+", ""):gsub("%s+$", "")
+            if base ~= "" then types[base] = (types[base] or 0) + 1; total = total + 1 end
         end
     end
-    return closest, bestTargetDist
+
+    local names = {}
+    for n in pairs(types) do table.insert(names, n) end
+    table.sort(names)
+    
+    for _, ch in ipairs(MobList:GetChildren()) do
+        if ch:IsA("TextButton") or ch:IsA("TextLabel") then ch:Destroy() end
+    end
+
+    if total == 0 then
+        local L = Instance.new("TextLabel")
+        L.Size = UDim2.new(1, 0, 0, 40)
+        L.BackgroundTransparency = 1
+        L.Text = "No mobs found."
+        L.TextColor3 = Color3.fromRGB(200, 120, 120)
+        L.Parent = MobList
+        return
+    end
+
+    local existing = {}
+    for _, n in ipairs(names) do existing[n] = true end
+    for i = #getgenv().Config.SelectedMobs, 1, -1 do
+        if not existing[getgenv().Config.SelectedMobs[i]] then table.remove(getgenv().Config.SelectedMobs, i) end
+    end
+
+    local function selected(name)
+        for _, n in ipairs(getgenv().Config.SelectedMobs) do if n == name then return true end end
+        return false
+    end
+
+    for i, n in ipairs(names) do
+        local on = selected(n)
+        local Btn = Instance.new("TextButton")
+        Btn.Size = UDim2.new(1, 0, 0, 25)
+        Btn.BackgroundColor3 = on and Color3.fromRGB(60, 120, 200) or Color3.fromRGB(50, 50, 60)
+        Btn.Text = string.format("%s %s", n, on and "ON" or "OFF")
+        Btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        Btn.Font = Enum.Font.Gotham
+        Btn.TextSize = 13
+        Btn.LayoutOrder = i
+        Btn.Parent = MobList
+        Instance.new("UICorner", Btn).CornerRadius = UDim.new(0, 4)
+
+        Btn.MouseButton1Click:Connect(function()
+            local removed = false
+            for idx, name in ipairs(getgenv().Config.SelectedMobs) do
+                if name == n then
+                    table.remove(getgenv().Config.SelectedMobs, idx)
+                    removed = true; break
+                end
+            end
+            if removed then
+                Btn.Text = string.format("%s OFF", n)
+                Btn.BackgroundColor3 = Color3.fromRGB(50, 50, 60)
+            else
+                table.insert(getgenv().Config.SelectedMobs, n)
+                Btn.Text = string.format("%s ON", n)
+                Btn.BackgroundColor3 = Color3.fromRGB(60, 120, 200)
+            end
+            CurrentMob = nil
+            HasArrivedMob = false
+            SaveConfig()
+        end)
+    end
+    MobList.CanvasSize = UDim2.new(0, 0, 0, #names * 30)
+    MobStatusLabel.Text = string.format("Loaded %d mob types.", #names)
+end)
+
+-- 3. SETTINGS TAB
+local SettingsTab = Instance.new("Frame")
+SettingsTab.Size = UDim2.new(1, -20, 1, -10)
+SettingsTab.Position = UDim2.new(0, 10, 0, 5)
+SettingsTab.BackgroundTransparency = 1
+SettingsTab.Visible = false
+SettingsTab.Parent = ContentArea
+Instance.new("UIListLayout", SettingsTab).Padding = UDim.new(0, 10)
+
+CreateInput(SettingsTab, "Fly Speed (Global)", getgenv().Config.FlySpeed, 1, function(v) getgenv().Config.FlySpeed = v end)
+
+local StopBtn = Instance.new("TextButton")
+StopBtn.Size = UDim2.new(1, 0, 0, 40)
+StopBtn.BackgroundColor3 = Color3.fromRGB(200, 50, 50)
+StopBtn.Text = "STOP SCRIPT"
+StopBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+StopBtn.Font = Enum.Font.GothamBold
+StopBtn.TextSize = 14
+StopBtn.LayoutOrder = 2
+StopBtn.Parent = SettingsTab
+Instance.new("UICorner", StopBtn).CornerRadius = UDim.new(0, 6)
+StopBtn.MouseButton1Click:Connect(Cleanup)
+
+-- TAB SWITCHING LOGIC
+local function SwitchTab(activeTab, activeBtn, inactiveTab1, inactiveBtn1, inactiveTab2, inactiveBtn2)
+    activeBtn.BackgroundColor3 = Color3.fromRGB(60, 120, 200)
+    activeBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    inactiveBtn1.BackgroundColor3 = Color3.fromRGB(35, 35, 40)
+    inactiveBtn1.TextColor3 = Color3.fromRGB(180, 180, 180)
+    inactiveBtn2.BackgroundColor3 = Color3.fromRGB(35, 35, 40)
+    inactiveBtn2.TextColor3 = Color3.fromRGB(180, 180, 180)
+    
+    activeTab.Visible = true
+    inactiveTab1.Visible = false
+    inactiveTab2.Visible = false
 end
 
-local function DoFly(Root, Humanoid, targetPos)
-    if Root.Anchored then
-        Root.Anchored = false
-        task.wait(0.05)
-    end
-    ToggleNoclip(true)
-    SaveHumanoidState(Humanoid)
-    if not Humanoid.PlatformStand then Humanoid.PlatformStand = true end
-    pcall(function() Humanoid.AutoRotate = false end)
+TabMiningBtn.MouseButton1Click:Connect(function() SwitchTab(MiningTab, TabMiningBtn, MobsTab, TabMobsBtn, SettingsTab, TabSettingsBtn) end)
+TabMobsBtn.MouseButton1Click:Connect(function() SwitchTab(MobsTab, TabMobsBtn, MiningTab, TabMiningBtn, SettingsTab, TabSettingsBtn) end)
+TabSettingsBtn.MouseButton1Click:Connect(function() SwitchTab(SettingsTab, TabSettingsBtn, MiningTab, TabMiningBtn, MobsTab, TabMobsBtn) end)
 
-    local fBp = Root:FindFirstChild("MinerFreeze"); if fBp then fBp:Destroy() end
-    local fBg = Root:FindFirstChild("MinerGyro");   if fBg then fBg:Destroy() end
-
-    local bv = Root:FindFirstChild("MinerFly")
-    if not bv then bv = Instance.new("BodyVelocity", Root); bv.Name = "MinerFly" end
-    bv.MaxForce = Vector3.new(1e5, 1e5, 1e5)
-
-    local delta = targetPos - Root.Position
-    local dist  = delta.Magnitude
-
-    if dist < 0.1 then
-        bv.Velocity = Vector3.zero
-    else
-        local safeSpeed = dist / 0.15
-        local speed = math.min(getgenv().Config.FlySpeed, safeSpeed)
-        speed = math.max(speed, 8)
-        bv.Velocity = delta.Unit * speed
-    end
-    task.wait(0.05)
-end
-
-local function DoMine(Root, Humanoid, Hitbox)
-    ToggleNoclip(true)
-    KillRockMovers()
-
-    SaveHumanoidState(Humanoid)
-    pcall(function() Humanoid.AutoRotate = false end)
-    pcall(function() Humanoid.WalkSpeed  = 0 end)
-    pcall(function() Humanoid.JumpPower  = 0 end)
-
-    local isNewTarget = (CurrentTarget ~= Hitbox)
-    if isNewTarget then
-        CurrentTarget = Hitbox
-        TargetPhase = "Top" 
-        TargetStartTime = tick()
-    end
-
-    local standPos = GetStandPos(Hitbox, TargetPhase)
-    local lookPos  = GetLookPos(Hitbox, TargetPhase)
-
-    Root.Anchored = true
-    Root.CFrame = CFrame.lookAt(standPos, lookPos)
-
-    if isNewTarget then
-        task.wait(0.2)
-    else
-        task.wait(0.05)
-    end
-
-    local cam = workspace.CurrentCamera
-    if cam and getgenv().Config.RotateToRock then
-        cam.CFrame = CFrame.lookAt(cam.CFrame.Position, lookPos)
-    end
-
-    ActivateTool()
-
-    if TargetPhase == "Top" then
-        TargetPhase = "Bottom"
-        task.wait(0.2) 
-    end
-
-    local delay = math.random(
-        math.floor(getgenv().Config.MinDelay * 1000),
-        math.floor(getgenv().Config.MaxDelay * 1000)) / 1000
-    task.wait(delay)
-end
+-- Select Mining by default
+TabMiningBtn.BackgroundColor3 = Color3.fromRGB(60, 120, 200)
+TabMiningBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
 
 -- ==========================================
--- MAIN LOOP
+-- MINING LOOP
 -- ==========================================
 task.spawn(function()
-    print("[Forge V53] Main loop started")
     while Alive() do
         task.wait(0.1)
 
         if not getgenv().Config.AutoMine then
-            ToggleNoclip(false)
-            UnanchorRoot()
             task.wait(0.5)
         else
             local char = LocalPlayer.Character
-            if not char then
-                task.wait(0.5)
-            else
+            if char then
                 local hum  = char:FindFirstChildOfClass("Humanoid")
                 local root = char:FindFirstChild("HumanoidRootPart")
-                
-                -- Check if tool is in hand
                 local tool = char:FindFirstChildOfClass("Tool")
 
-                if not hum or not root then
-                    task.wait(0.5)
-                elseif not tool then
-                    -- Removed auto-equip logic, just warn
-                    ToggleNoclip(false)
-                    UnanchorRoot()
-                    if hum.PlatformStand then hum.PlatformStand = false end
-                    RestoreHumanoidState(hum)
-                    CurrentTarget = nil
-                    SetStatus("No tool equipped in hand!")
-                    task.wait(1)
-                else
-                    local hitbox, targetDist = FindClosestRock(root)
-                    if hitbox then
-                        local currentPhase = (CurrentTarget == hitbox) and TargetPhase or "Top"
-                        local standPos = GetStandPos(hitbox, currentPhase)
-                        local dist = (root.Position - standPos).Magnitude
-
-                        local shouldFly = false
-                        if not root.Anchored then
-                            if dist > 2.5 then shouldFly = true end
-                        else
-                            if dist > 12 then shouldFly = true end
-                        end
-
-                        if shouldFly then
-                            DoFly(root, hum, standPos)
-                            SetStatus(string.format("Target: %s\nDist: %.1f | Mode: Flying (%s)",
-                                hitbox:FindFirstAncestorWhichIsA("Model").Name, dist, currentPhase))
-                        else
-                            local isTimeout = false
-                            if getgenv().Config.StuckTimeout > 0 and CurrentTarget == hitbox then
-                                if (tick() - TargetStartTime) > getgenv().Config.StuckTimeout then
-                                    isTimeout = true
-                                end
-                            end
-
-                            if isTimeout then
-                                local model = hitbox:FindFirstAncestorWhichIsA("Model")
-                                if model then
-                                    SkippedRocks[model] = tick()
-                                end
-                                CurrentTarget = nil
-                                UnanchorRoot()
-                                KillRockMovers()
-                                if hum.PlatformStand then hum.PlatformStand = false end
-                                RestoreHumanoidState(hum)
-                                SetStatus(string.format("Rock not broken in %d sec. Skipped.", getgenv().Config.StuckTimeout))
-                                task.wait(0.5)
-                            else
-                                DoMine(root, hum, hitbox)
-                                local model = hitbox:FindFirstAncestorWhichIsA("Model")
-                                SetStatus(string.format("Target: %s\nDist: %.1f | Mode: Mining (%s)",
-                                    model and model.Name or "?", dist, TargetPhase))
-                            end
-                        end
-                    else
-                        ToggleNoclip(false)
-                        UnanchorRoot()
-                        KillRockMovers()
-                        CurrentTarget = nil
-                        if hum.PlatformStand then hum.PlatformStand = false end
-                        RestoreHumanoidState(hum)
-                        
-                        if #getgenv().Config.SelectedRocks == 0 then
-                            SetStatus("Select rocks in DETECTED ROCKS list below")
-                        else
-                            SetStatus(string.format("No ores found\nSkipped: %d", CountSkipped()))
-                        end
+                if hum and root and tool then
+                    if #getgenv().Config.SelectedRocks == 0 then
+                        MineStatusLabel.Text = "Status: Select rocks in list!"
                         task.wait(0.5)
+                    else
+                        local rock, _ = FindClosestRock(root)
+                        if rock then
+                            if CurrentRock ~= rock then
+                                CurrentRock = rock
+                                RockPhase = "Top"
+                                RockStartTime = tick()
+                            end
+
+                            local targetPos = rock.Position
+                            local standPos = GetRockStandPos(rock, RockPhase)
+                            local distToStand = (root.Position - standPos).Magnitude
+
+                            if distToStand > 3.5 then
+                                StopCameraLock()
+                                if root.Anchored then root.Anchored = false; task.wait(0.05) end
+                                ToggleNoclip(true)
+                                SaveHumanoidState(hum)
+                                if not hum.PlatformStand then hum.PlatformStand = true end
+                                pcall(function() hum.AutoRotate = false end)
+
+                                local bv = root:FindFirstChild("MinerFly")
+                                if not bv then bv = Instance.new("BodyVelocity", root); bv.Name = "MinerFly" end
+                                bv.MaxForce = Vector3.new(1e5, 1e5, 1e5)
+
+                                local delta = standPos - root.Position
+                                local safeSpeed = delta.Magnitude / 0.15
+                                local speed = math.min(getgenv().Config.FlySpeed, safeSpeed)
+                                speed = math.max(speed, 8)
+                                bv.Velocity = delta.Unit * speed
+                                
+                                MineStatusLabel.Text = string.format("Flying to %s", rock:FindFirstAncestorWhichIsA("Model").Name)
+                            else
+                                KillMovers()
+                                SaveHumanoidState(hum)
+                                pcall(function() hum.WalkSpeed = 0 end)
+                                pcall(function() hum.JumpPower = 0 end)
+                                pcall(function() hum.AutoRotate = false end)
+
+                                root.Anchored = true
+                                local lookPos = GetRockLookPos(rock, RockPhase)
+                                local targetCF = CFrame.lookAt(standPos, lookPos)
+                                root.CFrame = targetCF
+
+                                local gyro = root:FindFirstChild("MinerGyro")
+                                if not gyro then gyro = Instance.new("BodyGyro", root); gyro.Name = "MinerGyro" end
+                                gyro.MaxTorque = Vector3.new(math.huge, math.huge, math.huge)
+                                gyro.D = 500
+                                gyro.P = 30000
+                                gyro.CFrame = targetCF
+
+                                if getgenv().Config.RotateToRock then
+                                    AttackTarget = lookPos
+                                    if not CamConnection then
+                                        local cam = workspace.CurrentCamera
+                                        if cam then cam.CameraType = Enum.CameraType.Scriptable end
+                                        CamConnection = RunService.RenderStepped:Connect(function()
+                                            if AttackTarget and workspace.CurrentCamera then
+                                                workspace.CurrentCamera.CFrame = CFrame.lookAt(workspace.CurrentCamera.CFrame.Position, AttackTarget)
+                                            end
+                                        end)
+                                    end
+                                end
+
+                                task.wait(0.05)
+                                ActivateMiningTool()
+
+                                MineStatusLabel.Text = string.format("Mining %s (%s)", rock:FindFirstAncestorWhichIsA("Model").Name, RockPhase)
+
+                                if RockPhase == "Top" then RockPhase = "Bottom" end
+
+                                if tick() - RockStartTime > getgenv().Config.StuckTimeoutRock then
+                                    SkippedRocks[rock:FindFirstAncestorWhichIsA("Model")] = tick()
+                                    CurrentRock = nil
+                                    MineStatusLabel.Text = "Rock timeout. Skipped."
+                                end
+                                task.wait(getgenv().Config.MinDelay)
+                            end
+                        else
+                            StopCameraLock()
+                            ToggleNoclip(false)
+                            UnanchorRoot()
+                            if hum.PlatformStand then hum.PlatformStand = false end
+                            RestoreHumanoidState(hum)
+                            MineStatusLabel.Text = "Searching for rocks..."
+                            task.wait(0.5)
+                        end
+                    end
+                else
+                    MineStatusLabel.Text = "No tool equipped!"
+                    task.wait(1)
+                end
+            end
+        end
+    end
+end)
+
+-- ==========================================
+-- MOB FLY LOOP
+-- ==========================================
+task.spawn(function()
+    while Alive() do
+        task.wait(0.1)
+
+        if not getgenv().Config.FlyToMob then
+            task.wait(0.5)
+        else
+            local char = LocalPlayer.Character
+            if char then
+                local hum  = char:FindFirstChildOfClass("Humanoid")
+                local root = char:FindFirstChild("HumanoidRootPart")
+
+                if hum and root then
+                    if #getgenv().Config.SelectedMobs == 0 then
+                        MobStatusLabel.Text = "Status: Select mobs in list!"
+                        task.wait(0.5)
+                    else
+                        if CurrentMob and not IsEnemyAlive(CurrentMob) then
+                            CurrentMob = nil
+                            HasArrivedMob = false
+                        end
+
+                        if not CurrentMob then
+                            local mob, _ = FindClosestMob(root)
+                            if mob then
+                                CurrentMob = mob
+                                HasArrivedMob = false
+                            else
+                                ToggleNoclip(false)
+                                UnanchorRoot()
+                                RestoreHumanoidState(hum)
+                                hum.PlatformStand = false
+                                MobStatusLabel.Text = "Searching for mobs..."
+                                task.wait(0.5)
+                            end
+                        end
+
+                        if CurrentMob then
+                            local mobRoot = CurrentMob:FindFirstChild("HumanoidRootPart") or CurrentMob.PrimaryPart
+                            if mobRoot then
+                                local targetPos = mobRoot.Position
+                                local rightVec = mobRoot.CFrame.RightVector
+                                local standPos = targetPos - Vector3.new(0, getgenv().Config.MobHeightOffset, 0) + (rightVec * getgenv().Config.MobSideOffset)
+                                
+                                local distToStand = (root.Position - standPos).Magnitude
+
+                                if not HasArrivedMob then
+                                    if distToStand > 3.5 then
+                                        if root.Anchored then root.Anchored = false; task.wait(0.05) end
+                                        ToggleNoclip(true)
+                                        SaveHumanoidState(hum)
+                                        if not hum.PlatformStand then hum.PlatformStand = true end
+                                        pcall(function() hum.AutoRotate = false end)
+
+                                        local bv = root:FindFirstChild("MobFly")
+                                        if not bv then bv = Instance.new("BodyVelocity", root); bv.Name = "MobFly" end
+                                        bv.MaxForce = Vector3.new(1e5, 1e5, 1e5)
+
+                                        local delta = standPos - root.Position
+                                        local safeSpeed = delta.Magnitude / 0.15
+                                        local speed = math.min(getgenv().Config.FlySpeed, safeSpeed)
+                                        speed = math.max(speed, 8)
+                                        bv.Velocity = delta.Unit * speed
+                                        
+                                        MobStatusLabel.Text = string.format("Flying to %s", CurrentMob.Name)
+                                    else
+                                        HasArrivedMob = true
+                                        MobWaitStartTime = tick()
+                                        
+                                        KillMovers()
+                                        ToggleNoclip(false)
+                                        UnanchorRoot()
+                                        pcall(function() hum.PlatformStand = false end)
+                                        RestoreHumanoidState(hum)
+
+                                        MobStatusLabel.Text = "Arrived! You have control."
+                                    end
+                                else
+                                    local timeSinceArrival = tick() - MobWaitStartTime
+                                    if timeSinceArrival > getgenv().Config.TimeoutDelayMob then
+                                        if CurrentMob and CurrentMob.Parent then
+                                            SkippedMobs[CurrentMob] = tick()
+                                        end
+                                        CurrentMob = nil
+                                        HasArrivedMob = false
+                                        MobStatusLabel.Text = "Timeout! Skipping mob."
+                                        task.wait(1)
+                                    else
+                                        MobStatusLabel.Text = string.format("Killing... Skip in %.1fs", getgenv().Config.TimeoutDelayMob - timeSinceArrival)
+                                    end
+                                end
+                            end
+                        end
                     end
                 end
             end
